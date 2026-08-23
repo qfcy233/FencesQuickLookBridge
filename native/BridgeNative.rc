@@ -1,0 +1,31 @@
+#include <windows.h>
+
+1 VERSIONINFO
+ FILEVERSION 3,4,2,0
+ PRODUCTVERSION 3,4,2,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Fences QuickLook Bridge\0"
+            VALUE "FileDescription", "Low-latency QuickLook bridge for Fences Folder Portals\0"
+            VALUE "FileVersion", "3.4.2.0\0"
+            VALUE "InternalName", "FencesQuickLookBridge\0"
+            VALUE "OriginalFilename", "FencesQuickLookBridge.exe\0"
+            VALUE "ProductName", "Fences QuickLook Bridge\0"
+            VALUE "ProductVersion", "3.4.2.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
+
+1 RT_MANIFEST "BridgeNative.manifest"

@@ -1,0 +1,17 @@
+# This development directory contains historical experiments and test artifacts.
+# Keep the public repository deny-by-default so they cannot be staged accidentally.
+*
+!.gitignore
+!.gitattributes
+!LICENSE
+!README.md
+!README.zh-CN.md
+!CHANGELOG.md
+!build.ps1
+!install.ps1
+!uninstall.ps1
+!native/
+native/*
+!native/BridgeNative.c
+!native/BridgeNative.rc
+!native/BridgeNative.manifest
