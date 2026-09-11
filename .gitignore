@@ -15,3 +15,8 @@ native/*
 !native/BridgeNative.c
 !native/BridgeNative.rc
 !native/BridgeNative.manifest
+!native/FencesQuickLookBridge.ico
+!tools/
+tools/*
+!tools/run-tests.ps1
+!tools/e2e-portal-space.ps1

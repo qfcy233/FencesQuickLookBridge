@@ -22,7 +22,8 @@
 #include <wchar.h>
 #include <math.h>
 
-#define BRIDGE_VERSION L"3.4.2-native"
+#define BRIDGE_VERSION L"3.4.4-native"
+#define IDI_APP_ICON 101
 #define MAX_PROCESS_IDS 64
 #define MAX_MONITORS 16
 #define MAX_PORTAL_GROUPS 64
@@ -40,9 +41,16 @@
 #define WM_REHOOK_QUICKLOOK (WM_APP + 1)
 #define WM_TRAY_ICON (WM_APP + 2)
 #define WM_SHOW_TRAY_STATUS (WM_APP + 3)
+#define WM_BRIDGE_QUERY (WM_APP + 4)
+#define WM_NOTIFY_UNRESPONSIVE_QUICKLOOK (WM_APP + 5)
 #define TRAY_COMMAND_REFRESH 1001
 #define TRAY_COMMAND_EXIT 1002
 #define TRAY_WINDOW_CLASS L"FencesQuickLookBridge.TrayWindow"
+#define STATUS_FILE_NAME L"FencesQuickLookBridge.status"
+#define QUICKLOOK_RESPONSE_TIMEOUT_MS 400
+#define QUICKLOOK_WATCHDOG_TIMER_ID 1
+#define QUICKLOOK_WATCHDOG_INTERVAL_MS 2000
+#define QUICKLOOK_START_GRACE_MS 20000
 
 #define LVM_FIRST_VALUE 0x1000
 #define LVM_GETITEMCOUNT_VALUE (LVM_FIRST_VALUE + 4)
@@ -155,6 +163,17 @@ static HWND g_trayWindow;
 static UINT g_taskbarCreatedMessage;
 static HICON g_trayIcon;
 
+static volatile LONG g_spacePressCount;
+static volatile LONG g_portalToggleCount;
+static volatile LONG g_invokeCount;
+static volatile LONG g_closeCount;
+static volatile LONG g_resolveFailureCount;
+static volatile LONG g_unresponsiveNotices;
+static DWORD g_lastResolveMilliseconds;
+static ULONGLONG g_startedAtTick;
+static BOOL g_quickLookWatchdogRunning;
+static ULONGLONG g_quickLookWatchdogStartedAt;
+
 static BOOL InitializePipeName(void);
 static void RefreshQuickLookPids(void);
 static void TraceHookEvent(const WCHAR *eventName, DWORD pid);
@@ -162,6 +181,18 @@ static BOOL ReinstallKeyboardHook(HINSTANCE instance, DWORD quickLookPid);
 static const WCHAR *FileNamePart(const WCHAR *path);
 static BOOL SendPipeMessage(const WCHAR *message, const WCHAR *path);
 static BOOL AddTrayIcon(HWND window);
+static BOOL IsWindowResponsive(HWND window);
+static void WriteStdoutText(const WCHAR *text);
+static void StartQuickLookWatchdog(void);
+static void StopQuickLookWatchdog(HWND window);
+static void ShowUnresponsiveQuickLookNotice(HWND window);
+
+static HICON LoadApplicationIcon(HINSTANCE instance, int width, int height)
+{
+    HICON icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP_ICON),
+        IMAGE_ICON, width, height, LR_DEFAULTCOLOR | LR_SHARED);
+    return icon ? icon : LoadIconW(NULL, IDI_APPLICATION);
+}
 
 static BOOL IsPidInList(DWORD pid, const DWORD *pids, int count)
 {
@@ -1156,6 +1187,7 @@ static void ScheduleQuickLookCoordination(DWORD pid)
     }
     LeaveCriticalSection(&g_actionLock);
     if (!scheduled) return;
+    StartQuickLookWatchdog();
     SetEvent(g_workerEvent);
     TraceHookEvent(L"COORDINATE", pid);
 }
@@ -1381,25 +1413,45 @@ static DWORD WINAPI WorkerMain(LPVOID parameter)
                 RefreshPortalCache();
             } else {
                 WCHAR selectedPath[PATH_CAPACITY];
+                ULONGLONG resolveStarted = GetTickCount64();
                 selectedPath[0] = L'\0';
                 if (ReadPortalSelectionFromView(portalWindow, path,
                     selectedPath, PATH_CAPACITY)) {
                     BOOL closesCurrent;
+                    InterlockedExchange((LONG *)&g_lastResolveMilliseconds,
+                        (LONG)min(GetTickCount64() - resolveStarted, 0x7FFFFFFF));
                     ResolveShortcut(selectedPath, resolved, PATH_CAPACITY);
                     closesCurrent = QuickLookShowsPath(resolved);
+                    if (closesCurrent) {
+                        /*
+                         * A frozen preview window never processes the Close
+                         * message. Detect it on this worker thread (never on the
+                         * keyboard hook thread) and tell the user once.
+                         */
+                        HWND preview = FindQuickLookWindow(TRUE);
+                        if (preview && !IsWindowResponsive(preview) && g_trayWindow)
+                            PostMessageW(g_trayWindow, WM_NOTIFY_UNRESPONSIVE_QUICKLOOK, 0, 0);
+                    }
                     if (IsActionCurrent(generation)) {
+                        InterlockedIncrement(&g_portalToggleCount);
                         if (closesCurrent) {
+                            InterlockedIncrement(&g_closeCount);
                             SendPipeMessage(L"QuickLook.App.PipeMessages.Close", L"");
                         } else {
+                            InterlockedIncrement(&g_invokeCount);
                             if (IsActionCurrent(generation))
                                 SendPipeMessage(L"QuickLook.App.PipeMessages.Invoke", resolved);
                         }
                     }
+                } else {
+                    InterlockedIncrement(&g_resolveFailureCount);
                 }
             }
         } else if (action == PreviewAction_Close) {
-            if (IsActionCurrent(generation))
+            if (IsActionCurrent(generation)) {
+                InterlockedIncrement(&g_closeCount);
                 SendPipeMessage(L"QuickLook.App.PipeMessages.Close", L"");
+            }
         }
         EnterCriticalSection(&g_actionLock);
         if (generation == g_actionGeneration) g_action = PreviewAction_None;
@@ -1439,6 +1491,7 @@ static LRESULT CALLBACK KeyboardCallback(int code, WPARAM message, LPARAM data)
         if (!AnyModifierDown() && IsNativeSelectionContext()
             && TryGetActivePortalView(&portalWindow, portalRoot, ROOT_CAPACITY)) {
             g_bridgePress = TRUE;
+            InterlockedIncrement(&g_spacePressCount);
             SchedulePortalToggle(portalWindow, portalRoot);
         }
     } else {
@@ -1487,10 +1540,11 @@ static BOOL AddTrayIcon(HWND window)
     iconData.uID = TRAY_ICON_ID;
     iconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     iconData.uCallbackMessage = WM_TRAY_ICON;
-    if (!g_trayIcon) g_trayIcon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!g_trayIcon) g_trayIcon = LoadApplicationIcon(GetModuleHandleW(NULL),
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     iconData.hIcon = g_trayIcon;
     wcsncpy_s(iconData.szTip, 128,
-        L"Fences QuickLook Bridge 3.4.2 - Running", _TRUNCATE);
+        L"Fences QuickLook Bridge 3.4.4 - Running", _TRUNCATE);
     return Shell_NotifyIconW(NIM_ADD, &iconData);
 }
 
@@ -1508,7 +1562,7 @@ static void ShowTrayStatus(HWND window)
 {
     WCHAR message[512];
     _snwprintf_s(message, 512, _TRUNCATE,
-        L"Fences QuickLook Bridge is running.\n\nVersion: 3.4.2\n"
+        L"Fences QuickLook Bridge is running.\n\nVersion: 3.4.4\n"
         L"Folder Portals detected: %d\nProcess ID: %lu",
         GetPortalViewCount(), (unsigned long)GetCurrentProcessId());
     MessageBoxW(window, message, L"Fences QuickLook Bridge",
@@ -1527,13 +1581,262 @@ static void RefreshFromTray(HWND window)
         L"Fences QuickLook Bridge", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
 }
 
+static BOOL IsWindowResponsive(HWND window)
+{
+    DWORD_PTR result = 0;
+    if (!window || !IsWindow(window)) return FALSE;
+    return SendMessageTimeoutW(window, WM_NULL, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, QUICKLOOK_RESPONSE_TIMEOUT_MS, &result) != 0;
+}
+
+static BOOL GetStatusFilePath(WCHAR *path, int capacity)
+{
+    WCHAR directory[MAX_PATH];
+    DWORD length = GetTempPathW(MAX_PATH, directory);
+    if (length == 0 || length >= MAX_PATH) return FALSE;
+    return _snwprintf_s(path, capacity, _TRUNCATE, L"%s%s",
+        directory, STATUS_FILE_NAME) > 0;
+}
+
+static void BuildStatusText(WCHAR *output, int capacity)
+{
+    WCHAR *activeRoot;
+    WCHAR *activeItem;
+    WCHAR quickLookPids[512];
+    WCHAR quickLookTitle[1024];
+    HWND active = (HWND)InterlockedCompareExchangePointer(&g_activePortalWindow,
+        NULL, NULL);
+    HWND quickLook = FindQuickLookWindow(TRUE);
+    PROCESS_MEMORY_COUNTERS_EX memory;
+    DWORD handles = 0;
+    int portalGroups;
+    int portalViews;
+    int i;
+    int offset = 0;
+    ULONGLONG uptime = g_startedAtTick ? (GetTickCount64() - g_startedAtTick) / 1000 : 0;
+
+    activeRoot = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+        ROOT_CAPACITY * sizeof(WCHAR));
+    activeItem = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+        ITEM_CAPACITY * sizeof(WCHAR));
+    if (!activeRoot || !activeItem) {
+        if (activeRoot) HeapFree(GetProcessHeap(), 0, activeRoot);
+        if (activeItem) HeapFree(GetProcessHeap(), 0, activeItem);
+        wcsncpy_s(output, capacity, L"Fences QuickLook Bridge: status unavailable.\n", _TRUNCATE);
+        return;
+    }
+
+    if (active && IsWindow(active) && IsWindowVisible(active)) {
+        int selectedIndex;
+        GetPortalRootForView(active, activeRoot, ROOT_CAPACITY);
+        selectedIndex = (int)SendMessageW(active, LVM_GETNEXTITEM_VALUE,
+            (WPARAM)-1, LVNI_SELECTED_VALUE);
+        if (selectedIndex < 0)
+            selectedIndex = (int)SendMessageW(active, LVM_GETNEXTITEM_VALUE,
+                (WPARAM)-1, LVNI_FOCUSED_VALUE);
+        if (selectedIndex >= 0) {
+            RemoteListReader reader;
+            if (InitializeRemoteListReader(active, ITEM_CAPACITY, &reader)) {
+                ReadRemoteListItemText(&reader, active, selectedIndex, activeItem,
+                    ITEM_CAPACITY);
+                DisposeRemoteListReader(&reader);
+            }
+        }
+    }
+
+    quickLookPids[0] = L'\0';
+    for (i = 0; i < g_quickLookPidCount && offset < 480; ++i) {
+        WCHAR entry[32];
+        _snwprintf_s(entry, 32, _TRUNCATE, L"%s%lu", i ? L"," : L"",
+            (unsigned long)g_quickLookPids[i]);
+        wcsncat_s(quickLookPids, 512, entry, _TRUNCATE);
+        offset += (int)wcslen(entry);
+    }
+
+    ZeroMemory(&memory, sizeof(memory));
+    memory.cb = sizeof(memory);
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&memory,
+        sizeof(memory));
+    GetProcessHandleCount(GetCurrentProcess(), &handles);
+    AcquireSRWLockShared(&g_portalCacheLock);
+    portalGroups = g_portalGroupCount;
+    portalViews = g_portalViewCount;
+    ReleaseSRWLockShared(&g_portalCacheLock);
+    quickLookTitle[0] = L'\0';
+    if (quickLook) GetWindowTextW(quickLook, quickLookTitle, 1024);
+
+    _snwprintf_s(output, capacity, _TRUNCATE,
+        L"Fences QuickLook Bridge live status\n"
+        L"Version=%s\nProcessId=%lu\nUptimeSeconds=%llu\n"
+        L"PortalGroups=%d\nPortalViews=%d\n"
+        L"ActivePortal=%p\nActivePortalRoot=%s\nActivePortalItem=%s\n"
+        L"LastResolveMs=%lu\nResolveFailures=%ld\n"
+        L"QuickLookPids=%s\nQuickLookVisible=%s\nQuickLookResponsive=%s\n"
+        L"QuickLookTitle=%s\nQuickLookHookPid=%lu\nQuickLookCoordinationPending=%s\n"
+        L"SpacePresses=%ld\nPortalToggles=%ld\nPreviewInvokes=%ld\nPreviewCloses=%ld\n"
+        L"UnresponsiveNotices=%ld\n"
+        L"WorkingSetMB=%.2f\nPrivateMB=%.2f\nHandles=%lu\n",
+        BRIDGE_VERSION, (unsigned long)GetCurrentProcessId(),
+        (unsigned long long)uptime,
+        portalGroups, portalViews,
+        active, activeRoot, activeItem,
+        (unsigned long)g_lastResolveMilliseconds, g_resolveFailureCount,
+        quickLookPids,
+        quickLook ? L"True" : L"False",
+        !quickLook ? L"NA" : (IsWindowResponsive(quickLook) ? L"True" : L"False"),
+        quickLookTitle,
+        (unsigned long)g_hookOrderedQuickLookPid,
+        g_quickLookCoordinationPending ? L"True" : L"False",
+        g_spacePressCount, g_portalToggleCount, g_invokeCount, g_closeCount,
+        g_unresponsiveNotices,
+        memory.WorkingSetSize / 1048576.0, memory.PrivateUsage / 1048576.0,
+        (unsigned long)handles);
+
+    HeapFree(GetProcessHeap(), 0, activeRoot);
+    HeapFree(GetProcessHeap(), 0, activeItem);
+}
+
+static BOOL WriteStatusToFile(void)
+{
+    WCHAR path[MAX_PATH];
+    WCHAR *text;
+    HANDLE file;
+    DWORD written = 0;
+    CHAR utf8[16384];
+    int byteCount;
+    BOOL success;
+    if (!GetStatusFilePath(path, MAX_PATH)) return FALSE;
+    text = (WCHAR *)VirtualAlloc(NULL, 16384 * sizeof(WCHAR),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!text) return FALSE;
+    BuildStatusText(text, 16384);
+    byteCount = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, (int)sizeof(utf8),
+        NULL, NULL);
+    VirtualFree(text, 0, MEM_RELEASE);
+    if (byteCount <= 1) return FALSE;
+    file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    success = WriteFile(file, utf8, (DWORD)(byteCount - 1), &written, NULL)
+        && written == (DWORD)(byteCount - 1);
+    CloseHandle(file);
+    return success;
+}
+
+static int RunStatusQuery(void)
+{
+    WCHAR path[MAX_PATH];
+    HWND tray;
+    DWORD_PTR result = 0;
+    HANDLE file;
+    CHAR utf8[16384];
+    DWORD read = 0;
+    int byteCount;
+    WCHAR *text;
+    if (!GetStatusFilePath(path, MAX_PATH)) return 7;
+    DeleteFileW(path);
+    tray = FindWindowW(TRAY_WINDOW_CLASS, NULL);
+    if (!tray) {
+        WriteStdoutText(L"FencesQuickLookBridge is not running.\n");
+        return 7;
+    }
+    if (!SendMessageTimeoutW(tray, WM_BRIDGE_QUERY, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &result)) {
+        WriteStdoutText(L"FencesQuickLookBridge did not answer the status query.\n");
+        return 8;
+    }
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        WriteStdoutText(L"FencesQuickLookBridge did not write a status report.\n");
+        return 8;
+    }
+    ReadFile(file, utf8, (DWORD)sizeof(utf8) - 1, &read, NULL);
+    CloseHandle(file);
+    utf8[read] = '\0';
+    byteCount = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (byteCount <= 1) return 8;
+    text = (WCHAR *)VirtualAlloc(NULL, (SIZE_T)byteCount * sizeof(WCHAR),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!text) return 8;
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, text, byteCount);
+    WriteStdoutText(text);
+    VirtualFree(text, 0, MEM_RELEASE);
+    return 0;
+}
+
+static void ShowUnresponsiveQuickLookNotice(HWND window)
+{
+    NOTIFYICONDATAW iconData;
+    if (InterlockedIncrement(&g_unresponsiveNotices) > 1) return;
+    ZeroMemory(&iconData, sizeof(iconData));
+    iconData.cbSize = sizeof(iconData);
+    iconData.hWnd = window;
+    iconData.uID = TRAY_ICON_ID;
+    iconData.uFlags = NIF_INFO;
+    iconData.dwInfoFlags = NIIF_WARNING;
+    iconData.uTimeout = 8000;
+    wcsncpy_s(iconData.szInfoTitle, 64, L"QuickLook is not responding", _TRUNCATE);
+    wcsncpy_s(iconData.szInfo, 256,
+        L"The preview window is frozen. Restart QuickLook, then press Space again.",
+        _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &iconData);
+}
+
+static void StartQuickLookWatchdog(void)
+{
+    if (g_quickLookWatchdogRunning || !g_trayWindow) return;
+    g_quickLookWatchdogRunning = TRUE;
+    g_quickLookWatchdogStartedAt = GetTickCount64();
+    SetTimer(g_trayWindow, QUICKLOOK_WATCHDOG_TIMER_ID, QUICKLOOK_WATCHDOG_INTERVAL_MS, NULL);
+}
+
+static void StopQuickLookWatchdog(HWND window)
+{
+    if (!g_quickLookWatchdogRunning) return;
+    g_quickLookWatchdogRunning = FALSE;
+    KillTimer(window, QUICKLOOK_WATCHDOG_TIMER_ID);
+}
+
+/*
+ * QuickLook installs its own low level keyboard hook when it starts. The bridge
+ * must be installed after QuickLook so that a Portal Space press reaches the
+ * bridge first. A QuickLook window-creation event normally triggers the reorder;
+ * the watchdog only runs while the bridge is waiting for a starting QuickLook,
+ * and it stops as soon as the order is correct. Idle operation stays
+ * event-driven: the watchdog is bounded by QUICKLOOK_START_GRACE_MS.
+ */
+static void QuickLookWatchdogTick(HWND window)
+{
+    DWORD pid;
+    if (g_quickLookPidCount > 0 && g_quickLookPids[0] == g_hookOrderedQuickLookPid) {
+        StopQuickLookWatchdog(window);
+        return;
+    }
+    if (GetTickCount64() - g_quickLookWatchdogStartedAt > QUICKLOOK_START_GRACE_MS) {
+        StopQuickLookWatchdog(window);
+        return;
+    }
+    /* WaitNamedPipeW with a zero timeout is cheap and needs no process scan. */
+    if (!IsQuickLookPipeReady()) return;
+    RefreshQuickLookPids();
+    if (g_quickLookPidCount <= 0) return;
+    pid = g_quickLookPids[0];
+    if (pid == g_hookOrderedQuickLookPid) {
+        StopQuickLookWatchdog(window);
+        return;
+    }
+    if (ReinstallKeyboardHook(GetModuleHandleW(NULL), pid))
+        StopQuickLookWatchdog(window);
+}
+
 static void ShowTrayMenu(HWND window)
 {
     HMENU menu = CreatePopupMenu();
     POINT cursor;
     UINT command;
     if (!menu) return;
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Running - version 3.4.2");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Running - version 3.4.4");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, TRAY_COMMAND_REFRESH,
         L"Refresh Folder Portals and QuickLook hook");
@@ -1561,6 +1864,18 @@ static LRESULT CALLBACK TrayWindowCallback(HWND window, UINT message,
             else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
                 ShowTrayMenu(window);
             return 0;
+        case WM_BRIDGE_QUERY:
+            WriteStatusToFile();
+            return TRUE;
+        case WM_NOTIFY_UNRESPONSIVE_QUICKLOOK:
+            ShowUnresponsiveQuickLookNotice(window);
+            return 0;
+        case WM_TIMER:
+            if (wParam == QUICKLOOK_WATCHDOG_TIMER_ID) {
+                QuickLookWatchdogTick(window);
+                return 0;
+            }
+            return DefWindowProcW(window, message, wParam, lParam);
         case WM_SHOW_TRAY_STATUS:
             ShowTrayStatus(window);
             return 0;
@@ -1585,7 +1900,10 @@ static HWND CreateTrayWindow(HINSTANCE instance)
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = TrayWindowCallback;
     windowClass.hInstance = instance;
-    windowClass.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    windowClass.hIcon = LoadApplicationIcon(instance,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    windowClass.hIconSm = LoadApplicationIcon(instance,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     windowClass.lpszClassName = TRAY_WINDOW_CLASS;
     if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return NULL;
@@ -1782,7 +2100,14 @@ static int RunNativeFlickerTest(const WCHAR *firstPath, const WCHAR *secondPath)
     if (!IsExistingPath(firstPath) || !IsExistingPath(secondPath)) return 20;
     RefreshQuickLookPids();
     SendPipeMessage(L"QuickLook.App.PipeMessages.Close", L"");
-    WaitForQuickLookHidden(3000);
+    if (!WaitForQuickLookHidden(3000)) {
+        HWND stuck = FindQuickLookWindow(TRUE);
+        _snwprintf_s(output, 1024, _TRUNCATE,
+            L"NATIVE_FLICKER_TEST_SKIPPED Reason=QuickLookDidNotClose Responsive=%s\n",
+            stuck && IsWindowResponsive(stuck) ? L"True" : L"False");
+        WriteStdoutText(output);
+        return 25;
+    }
     if (!SendPipeMessage(L"QuickLook.App.PipeMessages.Invoke", firstPath)
         || !WaitForQuickLookTitle(firstPath, 5000)) return 21;
     QueryPerformanceFrequency(&frequency);
@@ -1805,7 +2130,12 @@ static int RunNativeFlickerTest(const WCHAR *firstPath, const WCHAR *secondPath)
     if (!WaitForQuickLookTitle(secondPath, 5000)) return 23;
     qsort(latencies, 50, sizeof(double), CompareDouble);
     SendPipeMessage(L"QuickLook.App.PipeMessages.Close", L"");
-    if (!WaitForQuickLookHidden(3000)) return 24;
+    if (!WaitForQuickLookHidden(3000)) {
+        _snwprintf_s(output, 1024, _TRUNCATE,
+            L"NATIVE_FLICKER_TEST_SKIPPED Reason=QuickLookStayedOpenAfterClose\n");
+        WriteStdoutText(output);
+        return 24;
+    }
     _snwprintf_s(output, 1024, _TRUNCATE,
         L"NATIVE_FLICKER_TEST_OK SteadySwitches=50 BurstRequests=31 "
         L"AvgTitleMs=%.1f P95TitleMs=%.1f MaxTitleMs=%.1f\n",
@@ -1943,11 +2273,29 @@ static int RunCommandLine(int argc, WCHAR **argv)
         WCHAR output[PATH_CAPACITY + 4];
         path[0] = L'\0';
         RefreshPortalCache();
-        if (TryGetPortalSelection(path, PATH_CAPACITY)) {
+        InitializeActivePortalFromFocus();
+        if (!TryGetPortalSelection(path, PATH_CAPACITY))
+            TryGetAnyPortalSelection(path, PATH_CAPACITY);
+        if (path[0]) {
             _snwprintf_s(output, PATH_CAPACITY + 4, _TRUNCATE, L"%s\n", path);
             WriteStdoutText(output);
         }
         return path[0] ? 0 : 4;
+    }
+    if (_wcsicmp(argv[1], L"--status") == 0)
+        return RunStatusQuery();
+    if (_wcsicmp(argv[1], L"--quicklook-state") == 0) {
+        WCHAR title[1024];
+        WCHAR output[1200];
+        HWND quickLook;
+        RefreshQuickLookPids();
+        quickLook = FindQuickLookWindow(TRUE);
+        title[0] = L'\0';
+        if (quickLook) GetWindowTextW(quickLook, title, 1024);
+        _snwprintf_s(output, 1200, _TRUNCATE, L"Visible=%s Title=%s\n",
+            quickLook ? L"True" : L"False", title);
+        WriteStdoutText(output);
+        return quickLook ? 0 : 1;
     }
     if (_wcsicmp(argv[1], L"--portal-worker-test") == 0)
         return RunPortalWorkerTest();
@@ -2082,6 +2430,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR commandLine, i
     }
 
     InitializeCriticalSection(&g_actionLock);
+    g_startedAtTick = GetTickCount64();
     g_workerEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!g_workerEvent) {
         DeleteCriticalSection(&g_actionLock);
@@ -2134,6 +2483,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR commandLine, i
         exitCode = 1;
         if (g_trayWindow) DestroyWindow(g_trayWindow);
         else PostQuitMessage(0);
+    } else if (g_hookOrderedQuickLookPid == 0) {
+        StartQuickLookWatchdog();
     }
 
     while (GetMessageW(&message, NULL, 0, 0) > 0) {

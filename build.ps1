@@ -27,15 +27,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Resource compilation failed with exit code $LASTEXITCODE." }
 
     & $zig cc '-target' 'x86_64-windows-gnu' '-Os' '-s' '-DUNICODE' '-D_UNICODE' `
-        '-municode' 'BridgeNative.c' $resourceObject '-o' $outputExecutable `
+        '-municode' '-Wl,--subsystem,windows' 'BridgeNative.c' $resourceObject '-o' $outputExecutable `
         '-lcomctl32' '-lshell32' '-lole32' '-ladvapi32' '-lpsapi' '-luser32' '-lgdi32'
     if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE." }
 } finally {
     Pop-Location
 }
 
-& $outputExecutable '--version'
-if ($LASTEXITCODE -ne 0) { throw 'The built executable failed its version smoke test.' }
+$smokeTest = Start-Process -FilePath $outputExecutable -ArgumentList '--version' `
+    -WindowStyle Hidden -Wait -PassThru
+if ($smokeTest.ExitCode -ne 0) { throw 'The built executable failed its version smoke test.' }
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $outputExecutable).Hash
 Write-Host "Built: $outputExecutable"

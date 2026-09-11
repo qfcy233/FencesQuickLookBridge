@@ -31,7 +31,7 @@ QuickLook 更新有可能需要同步适配。
 
 ## 安装
 
-1. 从 Releases 下载 `FencesQuickLookBridge-v3.4.2-win-x64.zip`。
+1. 从 Releases 下载 `FencesQuickLookBridge-v3.4.4-win-x64.zip`。
 2. 解压全部文件。
 3. 右击 `install.ps1`，选择“使用 PowerShell 运行”。
 4. 在 Folder Portal 里选中文件，然后按空格键。
@@ -55,6 +55,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 - 右击并选择“退出”：停止程序。
 
 程序有单实例保护，正常情况下只运行一个进程。
+
+## 诊断命令
+
+同一份 exe 在常驻实例运行时可以回答几个只读查询：
+
+| 命令 | 用途 |
+| --- | --- |
+| `FencesQuickLookBridge.exe --status` | 读取常驻实例的实时状态：当前活动 Portal 选中项、QuickLook 钩子顺序、计数器、内存与句柄。 |
+| `FencesQuickLookBridge.exe --diagnose` | 一次性打印 Portal 缓存和 QuickLook 窗口快照。 |
+| `FencesQuickLookBridge.exe --portal-dump` | 列出所有识别到的 Folder Portal、列表窗口与项目。 |
+| `FencesQuickLookBridge.exe --portal-selection` | 把当前选中的 Portal 文件解析为完整路径。 |
+| `FencesQuickLookBridge.exe --quicklook-state` | 是否存在 QuickLook 预览窗口及其标题。 |
+| `FencesQuickLookBridge.exe --tray-status` | 常驻实例的托盘图标是否存在。 |
+
+如果 QuickLook 预览窗口卡死，程序会在托盘提示一次，而不是默默吞掉空格键；重启
+QuickLook 后再按空格即可。
+
+## 测试套件
+
+`tools` 目录保存了验收用的自动化脚本：
+
+```powershell
+.\tools\run-tests.ps1                  # 自检、深层目录矩阵、快速切换、状态查询
+.\tools\run-tests.ps1 -ForceDesktop    # 额外跑真实点击 + 空格的端到端测试
+```
+
+端到端测试需要桌面不被遮挡：它会真实点击 Folder Portal 里的文件并按真实空格键。不带
+`-ForceDesktop` 时，只要桌面被其他窗口挡住就会自动跳过，不会打扰当前使用。
 
 ## 卸载
 

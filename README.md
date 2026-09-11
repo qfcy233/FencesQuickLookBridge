@@ -33,7 +33,7 @@ Future Fences or QuickLook updates may require a bridge update.
 
 ## Install
 
-1. Download `FencesQuickLookBridge-v3.4.2-win-x64.zip` from the Releases page.
+1. Download `FencesQuickLookBridge-v3.4.4-win-x64.zip` from the Releases page.
 2. Extract the archive.
 3. Right-click `install.ps1` and choose **Run with PowerShell**.
 4. Select a file in a Folder Portal and press <kbd>Space</kbd>.
@@ -58,6 +58,37 @@ The source and reproducible build command are included in this repository for au
 - Right-click and choose **Exit** to stop the bridge.
 
 Only one instance can run at a time.
+
+## Diagnostics
+
+The same executable answers a few read-only queries while an instance is running:
+
+| Command | Purpose |
+| --- | --- |
+| `FencesQuickLookBridge.exe --status` | Live state of the running instance: active Portal selection, QuickLook hook order, counters, memory and handles. |
+| `FencesQuickLookBridge.exe --diagnose` | One-shot snapshot of the Portal cache and the QuickLook window. |
+| `FencesQuickLookBridge.exe --portal-dump` | Every detected Folder Portal, its list window and its items. |
+| `FencesQuickLookBridge.exe --portal-selection` | Resolve the currently selected Portal file to a full path. |
+| `FencesQuickLookBridge.exe --quicklook-state` | Whether a QuickLook preview window is open, and its title. |
+| `FencesQuickLookBridge.exe --tray-status` | Whether the tray icon of the running instance exists. |
+
+If the QuickLook preview window stops responding, the bridge shows a tray warning
+once instead of silently swallowing <kbd>Space</kbd>; restart QuickLook and press
+<kbd>Space</kbd> again.
+
+## Test suite
+
+The `tools` directory contains the automation used to validate a build:
+
+```powershell
+.\tools\run-tests.ps1                  # self tests, resolution matrix, flicker, status
+.\tools\run-tests.ps1 -ForceDesktop    # also run the real click + Space end-to-end test
+```
+
+The end-to-end test needs an unobstructed desktop because it clicks a real file
+inside a Folder Portal and presses a real <kbd>Space</kbd>. Without `-ForceDesktop`
+it skips whenever another window covers the desktop, so it never disturbs the
+current session.
 
 ## Uninstall
 
